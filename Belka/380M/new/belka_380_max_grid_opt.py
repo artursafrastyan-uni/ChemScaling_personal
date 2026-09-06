@@ -41,7 +41,7 @@ TOKENIZER_NAME = "yerevann/ChemLlama-380M"
 SEED           = 42
 RAW_PARQUET    = "/mnt/weka/asafrastyan/belka/data/train.parquet"
 DATA_DIR       = "/mnt/weka/asafrastyan/belka/data/processed_full"
-CKPT_DIR       = "/mnt/weka/asafrastyan/ChemScaling_personal/Belka/380M/new/weights" 
+CKPT_DIR       = "/mnt/weka/asafrastyan/refined/belka/380/weights" 
 os.makedirs(DATA_DIR,  exist_ok=True)
 os.makedirs(CKPT_DIR,  exist_ok=True)
 
