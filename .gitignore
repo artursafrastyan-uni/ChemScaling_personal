@@ -1,0 +1,27 @@
+# Python / PyTorch
+__pycache__/
+*.py[cod]
+*$py.class
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Slurm / Logs / Cache
+logs/
+*.out
+*.err
+*.log
+.ready
+.models_ready*
+.sweep_id
+
+# Wandb
+wandb/
+.wandb/
+
+# Data
+data/
+*.parquet
+*.csv
