@@ -263,7 +263,7 @@ class BelkaModel(pl.LightningModule):
         for p in self.backbone.parameters():
             p.requires_grad = False
 
-        n = CFG["unfreeze_last_n"]
+        n = CFG.get("n_unfreeze", CFG.get("unfreeze_last_n", 4))
         if n > 0:
             for layer in self.backbone.layers[-n:]:
                 for p in layer.parameters():
@@ -428,9 +428,7 @@ def train_trial(tokenizer):
     )
 
     strategy = DDPStrategy(
-        find_unused_parameters=False,
-        gradient_as_bucket_view=True,
-        static_graph=True
+        find_unused_parameters=True,
     ) if world_size > 1 else "auto"
 
     trainer = pl.Trainer(
@@ -464,6 +462,8 @@ def train_trial(tokenizer):
 
 def main():
     pl.seed_everything(SEED)
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))

@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:h100:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=250G
-#SBATCH --time=35:00:00
+#SBATCH --time=45:00:00
 #SBATCH --output=/mnt/weka/asafrastyan/ChemScaling_personal/Belka/380M/new/logs/%x_%j.out
 #SBATCH --error=/mnt/weka/asafrastyan/ChemScaling_personal/Belka/380M/new/logs/%x_%j.err
 #SBATCH --mail-user=arthsafrastyan@gmail.com
