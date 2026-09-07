@@ -22,23 +22,23 @@ HF_TOKEN = os.environ["HF_TOKEN"]
 MODEL_NAME     = "yerevann/ChemLlama-380M"
 TOKENIZER_NAME = "yerevann/ChemLlama-380M"
 
-# Weight checkpoint and target paths (380_max_grid.pt contains super-sweep-6 weights with val_AP 0.36203)
+# Weight checkpoint and target paths (380_max_grid.pt from genial-sweep-1 with val_AP 0.38145)
 CKPT_PATH = "/mnt/weka/asafrastyan/refined/belka/380/weights/380_max_grid.pt"
 TEST_PATH = "/mnt/weka/asafrastyan/belka/data/test.parquet"
 SUB_PATH  = "/mnt/weka/asafrastyan/refined/belka/380/submission_380_sub_10_max_grid_opt.csv"
 
-# Hyperparameters
+# Hyperparameters for genial-sweep-1
 CFG = {
-    "backbone_lr":       0.00013587292773745965,
-    "batch_size":        64,
-    "focal_gamma":       0,
-    "head_lr":           0.0004523907726246295,
+    "backbone_lr":       0.0006497625660002249,
+    "batch_size":        128,
+    "focal_gamma":       2,
+    "head_lr":           0.0002844060279673128,
     "mlp_hidden_size":   1024,
-    "n_unfreeze":         16,
+    "n_unfreeze":         8,
     "num_train_samples": 8968083,
-    "pooling":           "attn",
+    "pooling":           "last_token",
     "vocab":             128258,
-    "weight_decay":      0.05,
+    "weight_decay":      0.1,
     "dropout":           0.25,
 }
 
@@ -110,7 +110,7 @@ def canon_single(s):
         return s
 
 class TestDataset(Dataset):
-    def __init__(self, sm_list, tokenizer, max_len=256):
+    def __init__(self, sm_list, tokenizer, max_len=128):
         self.sm_list   = sm_list
         self.tokenizer = tokenizer
         self.max_len   = max_len
@@ -197,7 +197,7 @@ def main():
     with ctx.Pool(16) as pool:
         canon_smiles = pool.map(canon_single, unique_smiles)
 
-    ds = TestDataset(canon_smiles, tokenizer, max_len=256)
+    ds = TestDataset(canon_smiles, tokenizer, max_len=128)
     dl = DataLoader(
         ds, 
         batch_size=CFG["batch_size"], 
