@@ -49,7 +49,7 @@ os.makedirs(CKPT_DIR,  exist_ok=True)
 GLOBAL_BEST_VAL_AP = -1.0
 
 CFG = {
-    "batch_size":   64,
+    "batch_size":   128,
     "dropout":      0.25,
     "head_lr":      1e-4,
     "backbone_lr":  1e-5,  
@@ -58,7 +58,7 @@ CFG = {
     "focal_gamma":  2.0,
     "mlp_hidden_size": 512,
     "pooling":      "last_token",
-    "epochs":       2,
+    "epochs":       1,
     "patience":     35,
     "unfreeze_last_n": 6, 
 }
@@ -115,7 +115,7 @@ def prepare_data():
     print("Training data verified (SENTINEL found). Ready to proceed.")
 
 class TrainDataset(IterableDataset):
-    def __init__(self, tokenizer, max_len=256):
+    def __init__(self, tokenizer, max_len=128):
         self.tokenizer = tokenizer
         self.max_len   = max_len
         self.epoch     = 0
@@ -163,13 +163,6 @@ class TrainDataset(IterableDataset):
                         yield self._enc(sm[i], b4[i], hs[i], se[i])
 
     def _enc(self, s, a, b, c):
-        try:
-            mol = Chem.MolFromSmiles(s)
-            if mol is not None:
-                s = Chem.MolToSmiles(mol, doRandom=True)
-        except Exception:
-            pass
-
         prompt = f"[START_SMILES]{s}[END_SMILES]"
         e = self.tokenizer(
             prompt,
@@ -183,7 +176,7 @@ class TrainDataset(IterableDataset):
         }
 
 class ValDataset(Dataset):
-    def __init__(self, tokenizer, max_len=256):
+    def __init__(self, tokenizer, max_len=128):
         self.tokenizer = tokenizer
         self.max_len   = max_len
         self.rows      = []
@@ -388,7 +381,7 @@ def train_trial(tokenizer):
             "labels": labels
         }
 
-    train_ds = TrainDataset(tokenizer, max_len=256)
+    train_ds = TrainDataset(tokenizer, max_len=128)
     train_dl = DataLoader(
         train_ds,
         batch_size=CFG["batch_size"],
@@ -398,7 +391,7 @@ def train_trial(tokenizer):
         collate_fn=custom_collate
     )
     val_dl = DataLoader(
-        ValDataset(tokenizer, max_len=256),
+        ValDataset(tokenizer, max_len=128),
         batch_size=CFG["batch_size"],
         num_workers=8,
         pin_memory=True,
@@ -505,7 +498,7 @@ def main():
     if local_rank == 0:
         sweep_config = {
             'method': 'bayes',
-            'name': 'belka_380_max_grid',
+            'name': 'belka_380_max_grid_opt',
             'metric': {
                 'goal': 'minimize', 
                 'name': 'val_loss'
@@ -525,7 +518,7 @@ def main():
                     'values': [0.001, 0.05, 0.1, 0.2]
                 },
                 'mlp_hidden_size': {
-                    'values': [512, 1024, 2048]
+                    'values': [512, 1024]
                 },
                 'pooling': {
                     'values': ["last_token", "attn"]
@@ -533,16 +526,13 @@ def main():
                 'n_unfreeze': {
                     'values': [4, 8, 16]
                 },
-                'batch_size': {
-                    'values': [32, 64]
-                },
                 'focal_gamma': {
                     'values': [0, 2]
                 }
             }
         }
 
-        sweep_id_file = os.path.join(CKPT_DIR, ".sweep_id")
+        sweep_id_file = os.path.join(CKPT_DIR, ".sweep_id_380_opt")
         if os.path.exists(sweep_id_file):
             with open(sweep_id_file, "r") as f:
                 sweep_id = f.read().strip()
@@ -562,7 +552,6 @@ def main():
                 "mlp_hidden_size": wandb.config.mlp_hidden_size,
                 "pooling": wandb.config.pooling,
                 "n_unfreeze": wandb.config.n_unfreeze,
-                "batch_size": wandb.config.batch_size,
                 "focal_gamma": wandb.config.focal_gamma,
             }
             
@@ -573,7 +562,7 @@ def main():
             CFG.update(config)
             train_trial(tokenizer)
 
-        wandb.agent(sweep_id, project="chemlactica-belka-thesis", entity="artur_safrastyan-american-university-of-armenia", function=sweep_train, count=10)
+        wandb.agent(sweep_id, project="chemlactica-belka-thesis", entity="artur_safrastyan-american-university-of-armenia", function=sweep_train, count=20)
 
         signal = [False, None]
         if world_size > 1:

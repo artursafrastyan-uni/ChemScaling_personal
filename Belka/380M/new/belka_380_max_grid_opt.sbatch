@@ -1,10 +1,10 @@
 #!/bin/bash -l
 #SBATCH --job-name=belka_380_max_grid_opt
-#SBATCH --partition=research8
+#SBATCH --partition=research
 #SBATCH --account=research
-#SBATCH --gres=gpu:h100:8
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=250G
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
 #SBATCH --time=45:00:00
 #SBATCH --output=/mnt/weka/asafrastyan/ChemScaling_personal/Belka/380M/new/logs/%x_%j.out
 #SBATCH --error=/mnt/weka/asafrastyan/ChemScaling_personal/Belka/380M/new/logs/%x_%j.err
@@ -18,13 +18,6 @@ export HF_TOKEN=$(cat ~/.hf_token)
 export OMP_NUM_THREADS=1
 
 cd /mnt/weka/asafrastyan/ChemScaling_personal/Belka/380M/new
-mkdir -p /mnt/weka/asafrastyan/ChemScaling_personal/Belka/380M/new/logs
+mkdir -p logs
 
-NGPUS=8
-MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
-
-torchrun \
-  --standalone \
-  --nproc_per_node=$NGPUS \
-  --master_port=$MASTER_PORT \
-  belka_380_max_grid_opt.py
+python3 belka_380_max_grid_opt.py
