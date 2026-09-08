@@ -1,62 +1,70 @@
 import os
-import gc
+import glob
 import warnings
 warnings.filterwarnings("ignore")
+import time
+import random
+import gc
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+import wandb
+import multiprocessing
 from rdkit import Chem
 from tqdm import tqdm
-import multiprocessing
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, IterableDataset, Dataset
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoTokenizer, AutoModel
-import pytorch_lightning as pl
+from transformers import AutoTokenizer, AutoModel, get_cosine_schedule_with_warmup
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.strategies import DDPStrategy
+from torchmetrics.classification import MultilabelAveragePrecision, MultilabelAUROC
+from torchmetrics import MeanMetric
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.pop("WANDB_REQUIRE_SERVICE", None)
+WANDB_BASE = "/mnt/weka/asafrastyan/wandb"
+WANDB_CACHE = os.path.join(WANDB_BASE, "cache")
+WANDB_LOGS = os.path.join(WANDB_BASE, "logs")
+os.makedirs(WANDB_CACHE, exist_ok=True)
+os.makedirs(WANDB_LOGS, exist_ok=True)
+os.environ["WANDB_CACHE_DIR"] = WANDB_CACHE
+os.environ["WANDB_DIR"] = WANDB_LOGS
 os.environ["HF_TOKEN"] = "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"
-HF_TOKEN = os.environ["HF_TOKEN"]
-
-# Model and Tokenizer aligned with belka_380_max_grid_opt.py
+HF_TOKEN       = os.environ["HF_TOKEN"]
 MODEL_NAME     = "yerevann/ChemLlama-380M"
 TOKENIZER_NAME = "yerevann/ChemLlama-380M"
+SEED           = 42
+RAW_PARQUET    = "/mnt/weka/asafrastyan/belka/data/train.parquet"
+DATA_DIR       = "/mnt/weka/asafrastyan/belka/data/processed_full"
+CKPT_DIR       = "/mnt/weka/asafrastyan/refined/belka/380/weights"
+TEST_PATH      = "/mnt/weka/asafrastyan/belka/data/test.parquet"
+SUB_PATH       = "/mnt/weka/asafrastyan/refined/belka/380/submission_380_full.csv"
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(CKPT_DIR, exist_ok=True)
 
-# Weight checkpoint and target paths (380_max_grid.pt from genial-sweep-1 with val_AP 0.38145)
-CKPT_PATH = "/mnt/weka/asafrastyan/refined/belka/380/weights/380_max_grid.pt"
-TEST_PATH = "/mnt/weka/asafrastyan/belka/data/test.parquet"
-SUB_PATH  = "/mnt/weka/asafrastyan/refined/belka/380/submission_380_sub_10_max_grid_opt.csv"
-
-# Hyperparameters for genial-sweep-1
+# Optimal Hyperparameters derived from the best sweep run (radiant-sweep-17)
 CFG = {
-    "backbone_lr":       0.0006497625660002249,
     "batch_size":        128,
-    "focal_gamma":       2,
-    "head_lr":           0.0002844060279673128,
-    "mlp_hidden_size":   1024,
-    "n_unfreeze":         8,
-    "num_train_samples": 8968083,
-    "pooling":           "last_token",
-    "vocab":             128258,
-    "weight_decay":      0.1,
     "dropout":           0.25,
+    "head_lr":           0.004131039642439211,
+    "backbone_lr":       0.0004383710555599479,
+    "weight_decay":      0.2,
+    "warmup_ratio":      0.1,
+    "focal_gamma":       2.0,
+    "mlp_hidden_size":   1024,
+    "pooling":           "last_token",
+    "epochs":            1,
+    "unfreeze_last_n":   16,
+    "vocab":             128258,
 }
 
-class AttnPool(nn.Module):
-    def __init__(self, in_dim: int, dropout: float = 0.25):
-        super().__init__()
-        self.scorer = nn.Sequential(
-            nn.Linear(in_dim, in_dim),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-            nn.Linear(in_dim, 1),
-        )
-
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        scores = self.scorer(x).squeeze(-1)
-        scores = scores.masked_fill(attention_mask == 0, -1e4)
-        weights = torch.softmax(scores, dim=-1).unsqueeze(-1)
-        return (x * weights).sum(dim=1)
+SENTINEL       = os.path.join(DATA_DIR, ".ready")
+MODEL_SENTINEL = os.path.join(CKPT_DIR, ".models_ready_full")
 
 def _mean_pool(x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).to(x.dtype)
@@ -64,9 +72,108 @@ def _mean_pool(x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     denom = mask.sum(dim=1).clamp(min=1.0)
     return summed / denom
 
-class BelkaModel(pl.LightningModule):
-    def __init__(self, vocab: int = 128258, mlp_hidden_size: int = 1024, pooling: str = "attn"):
+def canon_single(s):
+    try:
+        return Chem.CanonSmiles(s.replace("[Dy]", "[H]"))
+    except:
+        return s
+
+def prepare_data():
+    if not os.path.exists(SENTINEL):
+        raise FileNotFoundError(
+            f"Prepared training data sentinel {SENTINEL} not found! "
+            "Please ensure data is prepared in DATA_DIR first."
+        )
+    print("Training data verified (SENTINEL found). Ready to proceed.")
+
+class TrainDataset(IterableDataset):
+    def __init__(self, tokenizer, max_len=128):
+        self.tokenizer = tokenizer
+        self.max_len   = max_len
+        self.epoch     = 0
+        self.rank      = int(os.environ.get("RANK", 0))
+        self.world     = int(os.environ.get("WORLD_SIZE", 1))
+
+    def set_epoch(self, e):
+        self.epoch = e
+
+    def __iter__(self):
+        files = sorted(glob.glob(os.path.join(DATA_DIR, "*.parquet")))
+        files = files[self.rank :: self.world]
+
+        wi        = torch.utils.data.get_worker_info()
+        worker_id = wi.id if wi else 0
+        n_workers = wi.num_workers if wi else 1
+        files     = files[worker_id :: n_workers]
+
+        if not files:
+            return
+        rng = random.Random((SEED + self.epoch * 10_000 + worker_id) % 2**32)
+
+        while True:
+            rng.shuffle(files)
+            for f in files:
+                pf     = pq.ParquetFile(f)
+                groups = list(range(pf.num_row_groups))
+                rng.shuffle(groups)
+                for g in groups:
+                    t   = pf.read_row_group(g)
+                    sm  = t["smiles"].to_numpy()
+                    sub = t["subset"].to_numpy()
+                    # Full training set: all samples where subset == 0 (no subsetting/hashing)
+                    idx = [i for i, s in enumerate(sm) if sub[i] == 0]
+                    if len(idx) == 0:
+                        continue
+                    b4  = t["BRD4"].to_numpy()
+                    hs  = t["HSA"].to_numpy()
+                    se  = t["sEH"].to_numpy()
+                    rng.shuffle(idx)
+                    for i in idx:
+                        yield self._enc(sm[i], b4[i], hs[i], se[i])
+
+    def _enc(self, s, a, b, c):
+        prompt = f"[START_SMILES]{s}[END_SMILES]"
+        e = self.tokenizer(
+            prompt,
+            truncation=True,
+            max_length=self.max_len, 
+            return_tensors="pt",
+        )
+        return {
+            "input_ids":      e["input_ids"].squeeze(0),
+            "attention_mask": e["attention_mask"].squeeze(0),
+            "labels":         torch.tensor([a, b, c], dtype=torch.float),
+        }
+
+class ReseedCallback(pl.Callback):
+    def __init__(self, dataset):
+        self.ds = dataset
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self.ds.set_epoch(trainer.current_epoch)
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0):
         super().__init__()
+        pos = torch.tensor([0.005, 0.005, 0.005])
+        self.register_buffer("wp", 1.0 / pos.sqrt())
+        self.register_buffer("wn", 1.0 / (1 - pos).sqrt())
+        self.gamma = gamma
+
+    def forward(self, x, y):
+        y_smooth = y * 0.9 + 0.05
+        bce   = F.binary_cross_entropy_with_logits(x, y_smooth, reduction="none")
+        pt    = torch.exp(-bce)
+        alpha = torch.where(y == 1, self.wp, self.wn)
+        alpha = alpha / alpha.mean()
+        return (alpha * (1 - pt) ** self.gamma * bce).mean()
+
+class BelkaModel(pl.LightningModule):
+    def __init__(self, vocab: int, num_train_samples: int):
+        super().__init__()
+        self.save_hyperparameters()
+        self.num_train_samples = num_train_samples
+
         self.backbone = AutoModel.from_pretrained(
             MODEL_NAME,
             token=HF_TOKEN,
@@ -74,40 +181,78 @@ class BelkaModel(pl.LightningModule):
             attn_implementation="sdpa",
         )
         self.backbone.resize_token_embeddings(vocab)
-        
-        dim = self.backbone.config.hidden_size
-        self.pooling = pooling
-        if self.pooling == "attn":
-            self.pool = AttnPool(dim, dropout=CFG.get("dropout", 0.25))
-        else:
-            self.pool = None
+        for p in self.backbone.parameters():
+            p.requires_grad = False
 
+        n = CFG.get("unfreeze_last_n", 16)
+        if n > 0:
+            for layer in self.backbone.layers[-n:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
+        if hasattr(self.backbone, "norm"):
+            for p in self.backbone.norm.parameters():
+                p.requires_grad = True
+
+        dim = self.backbone.config.hidden_size
+        self.pooling = CFG["pooling"]
+
+        mlp_hidden_size = CFG["mlp_hidden_size"]
         self.head = nn.Sequential(
-            nn.Dropout(CFG.get("dropout", 0.25)),
+            nn.Dropout(CFG["dropout"]),
             nn.Linear(dim, mlp_hidden_size),
             nn.GELU(),
-            nn.Dropout(CFG.get("dropout", 0.25)),
+            nn.Dropout(CFG["dropout"]),
             nn.Linear(mlp_hidden_size, 3),
         )
+        self.loss = FocalLoss(CFG["focal_gamma"])
+        self.tr_ap = MultilabelAveragePrecision(num_labels=3, average="macro")
+        self.tr_auc = MultilabelAUROC(num_labels=3, average="macro")
+        self.train_loss_avg = MeanMetric()
 
     def forward(self, ids, mask):
         h = self.backbone(input_ids=ids, attention_mask=mask).last_hidden_state
-        if self.pooling == "attn":
-            pooled = self.pool(h, attention_mask=mask)
-        elif self.pooling == "last_token":
+        if self.pooling == "last_token":
             batch_idx = torch.arange(ids.shape[0], device=ids.device)
             last_token_idx = mask.sum(1).long() - 1
             pooled = h[batch_idx, last_token_idx, :]
         else:
             pooled = _mean_pool(h, attention_mask=mask)
-
         return self.head(pooled)
 
-def canon_single(s):
-    try:
-        return Chem.CanonSmiles(s.replace("[Dy]", "[H]"))
-    except:
-        return s
+    def training_step(self, batch, batch_idx):
+        logits = self(batch["input_ids"], batch["attention_mask"])
+        loss = self.loss(logits, batch["labels"])
+        preds = torch.sigmoid(logits)
+        self.tr_ap.update(preds, batch["labels"].long())
+        self.tr_auc.update(preds, batch["labels"].long())
+        self.train_loss_avg.update(loss)
+        self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False)
+        self.log("train_AP", self.tr_ap, on_step=False, on_epoch=True)
+        self.log("train_AUC", self.tr_auc, on_step=False, on_epoch=True)
+        return loss
+
+    def on_train_epoch_end(self):
+        train_loss_epoch = self.train_loss_avg.compute()
+        self.log("train_loss_epoch", train_loss_epoch, sync_dist=True)
+        self.train_loss_avg.reset()
+
+    def configure_optimizers(self):
+        backbone_params = [p for p in self.backbone.parameters() if p.requires_grad]
+        head_params = list(self.head.parameters())
+
+        opt = torch.optim.AdamW([
+            {"params": backbone_params, "lr": CFG["backbone_lr"], "weight_decay": CFG["weight_decay"]},
+            {"params": head_params, "lr": CFG["head_lr"], "weight_decay": CFG["weight_decay"]},
+        ])
+
+        world = max(self.trainer.world_size, 1)
+        total = (self.num_train_samples // (CFG["batch_size"] * world * 4)) * CFG["epochs"]
+        sch = get_cosine_schedule_with_warmup(
+            opt,
+            num_warmup_steps=int(total * CFG["warmup_ratio"]),
+            num_training_steps=total,
+        )
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "step"}}
 
 class TestDataset(Dataset):
     def __init__(self, sm_list, tokenizer, max_len=128):
@@ -139,11 +284,196 @@ def test_collate(batch, pad_token_id):
     attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
     return {"input_ids": input_ids, "attention_mask": attention_mask}
 
+def train_full(tokenizer):
+    pl.seed_everything(SEED)
+
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    num_train_samples = 0
+    for f in sorted(glob.glob(os.path.join(DATA_DIR, "*.parquet"))):
+        t = pq.read_table(f, columns=["subset"])
+        sub_list = t["subset"].to_pylist()
+        num_train_samples += sum(1 for sub in sub_list if sub == 0)
+    print(f"Total training samples (Full Dataset): {num_train_samples:,}")
+
+    train_batches = num_train_samples // (CFG["batch_size"] * world_size)
+
+    def custom_collate(batch):
+        input_ids = [item["input_ids"] for item in batch]
+        attention_mask = [item["attention_mask"] for item in batch]
+        labels = [item["labels"] for item in batch]
+        
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
+        attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+        labels = torch.stack(labels)
+        
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels
+        }
+
+    train_ds = TrainDataset(tokenizer, max_len=128)
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=CFG["batch_size"],
+        num_workers=8,
+        pin_memory=True,
+        prefetch_factor=4,
+        collate_fn=custom_collate
+    )
+    
+    logger = WandbLogger(
+        project="chemlactica-belka-thesis",
+        name="belka_380_full_training",
+        save_dir=WANDB_LOGS,
+        log_model=False,
+    )
+
+    model = BelkaModel(vocab=len(tokenizer), num_train_samples=num_train_samples)
+    reseed_cb = ReseedCallback(train_ds)
+
+    strategy = DDPStrategy(
+        find_unused_parameters=True,
+    ) if world_size > 1 else "auto"
+
+    trainer = pl.Trainer(
+        accelerator="gpu",
+        devices="auto",
+        strategy=strategy,
+        precision="bf16-mixed",
+        max_epochs=CFG["epochs"],
+        logger=logger,
+        callbacks=[reseed_cb],
+        limit_train_batches=train_batches,
+        log_every_n_steps=20,
+        num_sanity_val_steps=0,
+        accumulate_grad_batches=4,
+    )
+    
+    print("Starting Full BELKA training (100% dataset, no validation)...")
+    trainer.fit(
+        model, 
+        train_dataloaders=train_dl
+    )
+
+    # Save final trained weights
+    if trainer.global_rank == 0:
+        out_weights = os.path.join(CKPT_DIR, "380_full.pt")
+        sd = model.state_dict()
+        keys_to_remove = [k for k in sd.keys() if 'loss' in k or 'tr_' in k or 'train_' in k]
+        for k in keys_to_remove:
+            del sd[k]
+        torch.save(sd, out_weights)
+        print(f"Full dataset training complete! Final weights saved to: {out_weights}")
+
+        # Teardown DDP before test inference
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+        del model, trainer, train_dl, train_ds
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Run test inference on the test set
+        if os.path.exists(TEST_PATH):
+            print("Running test set inference with full-dataset trained model...")
+            test_df = pd.read_parquet(TEST_PATH)
+            unique_smiles = test_df['molecule_smiles'].unique()
+            print(f"Total rows: {len(test_df):,}, Unique smiles: {len(unique_smiles):,}")
+
+            print("Canonicalising smiles in parallel...")
+            ctx = multiprocessing.get_context("spawn")
+            with ctx.Pool(16) as pool:
+                canon_smiles = pool.map(canon_single, unique_smiles)
+
+            inf_model = BelkaModel(vocab=len(tokenizer), num_train_samples=num_train_samples)
+            inf_sd = torch.load(out_weights, map_location="cpu", weights_only=False)
+            inf_model.load_state_dict(inf_sd, strict=False)
+            inf_model.eval()
+            if torch.cuda.is_available():
+                inf_model.cuda()
+                inf_model.to(torch.bfloat16)
+
+            ds = TestDataset(canon_smiles, tokenizer, max_len=128)
+            dl = DataLoader(
+                ds,
+                batch_size=CFG["batch_size"],
+                num_workers=8,
+                pin_memory=True,
+                prefetch_factor=4,
+                persistent_workers=True,
+                shuffle=False,
+                collate_fn=lambda b: test_collate(b, tokenizer.pad_token_id)
+            )
+
+            all_preds = []
+            with torch.inference_mode():
+                for batch in tqdm(dl, desc="Predicting test set"):
+                    if torch.cuda.is_available():
+                        ids = batch["input_ids"].cuda()
+                        mask = batch["attention_mask"].cuda()
+                    else:
+                        ids = batch["input_ids"]
+                        mask = batch["attention_mask"]
+
+                    logits = inf_model(ids, mask)
+                    preds = torch.sigmoid(logits).float().cpu().numpy()
+                    all_preds.append(preds)
+
+            all_preds = np.concatenate(all_preds, axis=0)
+
+            print("Merging predictions into submission format...")
+            pred_df = pd.DataFrame({
+                'molecule_smiles': unique_smiles,
+                'BRD4': all_preds[:, 0],
+                'HSA':  all_preds[:, 1],
+                'sEH':  all_preds[:, 2],
+            })
+
+            test_df = test_df.merge(pred_df, on='molecule_smiles', how='left')
+            test_df['binds'] = 0.0
+
+            brd4_mask = test_df['protein_name'] == 'BRD4'
+            hsa_mask  = test_df['protein_name'] == 'HSA'
+            seh_mask  = test_df['protein_name'] == 'sEH'
+
+            test_df.loc[brd4_mask, 'binds'] = test_df.loc[brd4_mask, 'BRD4']
+            test_df.loc[hsa_mask,  'binds'] = test_df.loc[hsa_mask,  'HSA']
+            test_df.loc[seh_mask,  'binds'] = test_df.loc[seh_mask,  'sEH']
+
+            os.makedirs(os.path.dirname(SUB_PATH), exist_ok=True)
+            sub = test_df[['id', 'binds']]
+            sub.to_csv(SUB_PATH, index=False)
+            print(f"Submission successfully saved to {SUB_PATH}")
+
 def main():
+    pl.seed_everything(SEED)
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
 
-    print(f"Loading tokenizer from {TOKENIZER_NAME}...")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if world_size > 1:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend="nccl" if torch.cuda.is_available() else "gloo",
+                init_method="env://"
+            )
+
+    if local_rank == 0:
+        print("Downloading tokenizer and backbone to HF cache …")
+        AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
+        AutoModel.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+        open(MODEL_SENTINEL, "w").close()
+        print("Models cached.")
+    else:
+        print(f"[rank {local_rank}] waiting for model cache …")
+        while not os.path.exists(MODEL_SENTINEL):
+            time.sleep(2)
+
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
@@ -151,104 +481,14 @@ def main():
         {"additional_special_tokens": ["[START_SMILES]", "[END_SMILES]"]}
     )
 
-    print(f"Loading weights from {CKPT_PATH}...")
-    if not os.path.exists(CKPT_PATH):
-        raise FileNotFoundError(f"Checkpoint not found at {CKPT_PATH}")
-
-    sd = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
-    if "state_dict" in sd:
-        sd = sd["state_dict"]
-
-    # Filter out training/validation metrics
-    keys_to_remove = [k for k in sd.keys() if 'loss' in k or 'tr_' in k or 'val_' in k]
-    for k in keys_to_remove:
-        del sd[k]
-
-    # Dynamically verify head & pool architecture to guarantee shape compatibility
-    ckpt_mlp = sd["head.1.weight"].shape[0] if "head.1.weight" in sd else CFG["mlp_hidden_size"]
-    has_pool = any("pool" in k for k in sd)
-    ckpt_pooling = "attn" if has_pool else "last_token"
-
-    if ckpt_mlp != CFG["mlp_hidden_size"] or (ckpt_pooling == "attn") != (CFG["pooling"] == "attn"):
-        print(f"Notice: Checkpoint layer dimensions ({ckpt_mlp} MLP, {ckpt_pooling} pooling) differ from default CFG ({CFG['mlp_hidden_size']} MLP, {CFG['pooling']} pooling).")
-        print(f"Auto-aligning model architecture to match checkpoint weights ({ckpt_mlp} MLP, {ckpt_pooling}) for exact loading.")
-        model_mlp = ckpt_mlp
-        model_pooling = ckpt_pooling
+    if local_rank == 0:
+        prepare_data()
     else:
-        model_mlp = CFG["mlp_hidden_size"]
-        model_pooling = CFG["pooling"]
+        print(f"[rank {local_rank}] waiting for data …")
+        while not os.path.exists(SENTINEL):
+            time.sleep(2)
 
-    print("Initializing model architecture...")
-    model = BelkaModel(vocab=CFG["vocab"], mlp_hidden_size=model_mlp, pooling=model_pooling)
-    model.load_state_dict(sd, strict=False)
-    model.eval()
-
-    if torch.cuda.is_available():
-        model.cuda()
-        model.to(torch.bfloat16)
-
-    print("Loading test data...")
-    test_df = pd.read_parquet(TEST_PATH)
-    unique_smiles = test_df['molecule_smiles'].unique()
-    print(f"Total rows: {len(test_df):,}, Unique smiles: {len(unique_smiles):,}")
-
-    print("Canonicalising smiles in parallel...")
-    ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(16) as pool:
-        canon_smiles = pool.map(canon_single, unique_smiles)
-
-    ds = TestDataset(canon_smiles, tokenizer, max_len=128)
-    dl = DataLoader(
-        ds, 
-        batch_size=CFG["batch_size"], 
-        num_workers=8, 
-        pin_memory=True, 
-        prefetch_factor=4,
-        persistent_workers=True,
-        shuffle=False, 
-        collate_fn=lambda b: test_collate(b, tokenizer.pad_token_id)
-    )
-
-    print("Running evaluation / inference (pure test evaluation)...")
-    all_preds = []
-    with torch.inference_mode():
-        for batch in tqdm(dl, desc="Predicting test set"):
-            if torch.cuda.is_available():
-                ids = batch["input_ids"].cuda()
-                mask = batch["attention_mask"].cuda()
-            else:
-                ids = batch["input_ids"]
-                mask = batch["attention_mask"]
-
-            logits = model(ids, mask)
-            preds = torch.sigmoid(logits).float().cpu().numpy()
-            all_preds.append(preds)
-
-    all_preds = np.concatenate(all_preds, axis=0)
-
-    print("Merging predictions into submission format...")
-    pred_df = pd.DataFrame({
-        'molecule_smiles': unique_smiles,
-        'BRD4': all_preds[:, 0],
-        'HSA':  all_preds[:, 1],
-        'sEH':  all_preds[:, 2],
-    })
-
-    test_df = test_df.merge(pred_df, on='molecule_smiles', how='left')
-    test_df['binds'] = 0.0
-
-    brd4_mask = test_df['protein_name'] == 'BRD4'
-    hsa_mask  = test_df['protein_name'] == 'HSA'
-    seh_mask  = test_df['protein_name'] == 'sEH'
-
-    test_df.loc[brd4_mask, 'binds'] = test_df.loc[brd4_mask, 'BRD4']
-    test_df.loc[hsa_mask,  'binds'] = test_df.loc[hsa_mask,  'HSA']
-    test_df.loc[seh_mask,  'binds'] = test_df.loc[seh_mask,  'sEH']
-
-    os.makedirs(os.path.dirname(SUB_PATH), exist_ok=True)
-    sub = test_df[['id', 'binds']]
-    sub.to_csv(SUB_PATH, index=False)
-    print(f"Evaluation complete! Submission successfully saved to {SUB_PATH}")
+    train_full(tokenizer)
 
 if __name__ == "__main__":
     main()
