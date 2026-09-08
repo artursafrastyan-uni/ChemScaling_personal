@@ -43,7 +43,7 @@ RAW_PARQUET    = "/mnt/weka/asafrastyan/belka/data/train.parquet"
 DATA_DIR       = "/mnt/weka/asafrastyan/belka/data/processed_full"
 CKPT_DIR       = "/mnt/weka/asafrastyan/refined/belka/380/weights"
 TEST_PATH      = "/mnt/weka/asafrastyan/belka/data/test.parquet"
-SUB_PATH       = "/mnt/weka/asafrastyan/refined/belka/380/submission_380_full.csv"
+SUB_PATH       = f"/mnt/weka/asafrastyan/refined/belka/380/submission_380_full_{SEED}.csv"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CKPT_DIR, exist_ok=True)
 
@@ -64,7 +64,7 @@ CFG = {
 }
 
 SENTINEL       = os.path.join(DATA_DIR, ".ready")
-MODEL_SENTINEL = os.path.join(CKPT_DIR, ".models_ready_full")
+MODEL_SENTINEL = os.path.join(CKPT_DIR, f".models_ready_full_{SEED}")
 
 def _mean_pool(x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).to(x.dtype)
@@ -119,14 +119,10 @@ class TrainDataset(IterableDataset):
                 for g in groups:
                     t   = pf.read_row_group(g)
                     sm  = t["smiles"].to_numpy()
-                    sub = t["subset"].to_numpy()
-                    # Full training set: all samples where subset == 0 (no subsetting/hashing)
-                    idx = [i for i, s in enumerate(sm) if sub[i] == 0]
-                    if len(idx) == 0:
-                        continue
                     b4  = t["BRD4"].to_numpy()
                     hs  = t["HSA"].to_numpy()
                     se  = t["sEH"].to_numpy()
+                    idx = list(range(len(sm)))
                     rng.shuffle(idx)
                     for i in idx:
                         yield self._enc(sm[i], b4[i], hs[i], se[i])
@@ -290,10 +286,9 @@ def train_full(tokenizer):
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     num_train_samples = 0
     for f in sorted(glob.glob(os.path.join(DATA_DIR, "*.parquet"))):
-        t = pq.read_table(f, columns=["subset"])
-        sub_list = t["subset"].to_pylist()
-        num_train_samples += sum(1 for sub in sub_list if sub == 0)
-    print(f"Total training samples (Full Dataset): {num_train_samples:,}")
+        pf = pq.ParquetFile(f)
+        num_train_samples += pf.metadata.num_rows
+    print(f"Total training samples (100% Full Dataset): {num_train_samples:,}")
 
     train_batches = num_train_samples // (CFG["batch_size"] * world_size)
 
@@ -324,7 +319,7 @@ def train_full(tokenizer):
     
     logger = WandbLogger(
         project="chemlactica-belka-thesis",
-        name="belka_380_full_training",
+        name=f"belka_380_full_training_{SEED}",
         save_dir=WANDB_LOGS,
         log_model=False,
     )
@@ -358,7 +353,7 @@ def train_full(tokenizer):
 
     # Save final trained weights
     if trainer.global_rank == 0:
-        out_weights = os.path.join(CKPT_DIR, "380_full.pt")
+        out_weights = os.path.join(CKPT_DIR, f"380_full_{SEED}.pt")
         sd = model.state_dict()
         keys_to_remove = [k for k in sd.keys() if 'loss' in k or 'tr_' in k or 'train_' in k]
         for k in keys_to_remove:
