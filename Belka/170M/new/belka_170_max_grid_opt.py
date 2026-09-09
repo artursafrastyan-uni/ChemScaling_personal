@@ -36,9 +36,8 @@ os.environ["WANDB_CACHE_DIR"] = WANDB_CACHE
 os.environ["WANDB_DIR"] = WANDB_LOGS
 os.environ["HF_TOKEN"] = "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"
 HF_TOKEN       = os.environ["HF_TOKEN"]
-MODEL_NAME     = "yerevann/chemllama-170m"
-TOKENIZER_NAME = "yerevann/chemllama-170m"
-COMMIT_HASH    = "c338af6fe496987024d4fe9ea1b037dfba866c5c"
+MODEL_NAME     = "yerevann/ChemLlama-170M"
+TOKENIZER_NAME = "yerevann/ChemLlama-170M"
 SEED           = 42
 RAW_PARQUET    = "/mnt/weka/asafrastyan/belka/data/train.parquet"
 DATA_DIR       = "/mnt/weka/asafrastyan/belka/data/processed_full"
@@ -249,7 +248,6 @@ class BelkaModel(pl.LightningModule):
 
         self.backbone = AutoModel.from_pretrained(
             MODEL_NAME,
-            revision=COMMIT_HASH,
             token=HF_TOKEN,
             torch_dtype=torch.bfloat16,
             attn_implementation="sdpa"
@@ -474,8 +472,8 @@ def main():
 
     if local_rank == 0:
         print("Downloading tokenizer and backbone to HF cache …")
-        AutoTokenizer.from_pretrained(TOKENIZER_NAME, revision=COMMIT_HASH, token=HF_TOKEN)
-        AutoModel.from_pretrained(MODEL_NAME, revision=COMMIT_HASH, token=HF_TOKEN)
+        AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
+        AutoModel.from_pretrained(MODEL_NAME, token=HF_TOKEN)
         open(MODEL_SENTINEL, "w").close()
         print("Models cached.")
     else:
@@ -483,7 +481,7 @@ def main():
         while not os.path.exists(MODEL_SENTINEL):
             time.sleep(2)
 
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, revision=COMMIT_HASH, token=HF_TOKEN)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
     tokenizer.add_special_tokens(
@@ -582,6 +580,10 @@ def main():
             CFG.update(config)
             
             train_trial(tokenizer)
+
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

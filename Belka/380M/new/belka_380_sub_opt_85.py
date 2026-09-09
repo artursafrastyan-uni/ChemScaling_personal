@@ -5,6 +5,7 @@ warnings.filterwarnings("ignore")
 import time
 import random
 import gc
+from datetime import timedelta
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -22,7 +23,6 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, AutoModel, get_cosine_schedule_with_warmup
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies import DDPStrategy
-from torchmetrics.classification import MultilabelAveragePrecision, MultilabelAUROC
 from torchmetrics import MeanMetric
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -44,6 +44,7 @@ DATA_DIR       = "/mnt/weka/asafrastyan/belka/data/processed_full"
 CKPT_DIR       = "/mnt/weka/asafrastyan/refined/belka/380/weights"
 TEST_PATH      = "/mnt/weka/asafrastyan/belka/data/test.parquet"
 SUB_PATH       = f"/mnt/weka/asafrastyan/refined/belka/380/submission_380_full_{SEED}.csv"
+FINAL_WEIGHTS  = os.path.join(CKPT_DIR, f"380_full_{SEED}.pt")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CKPT_DIR, exist_ok=True)
 
@@ -148,6 +149,32 @@ class ReseedCallback(pl.Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         self.ds.set_epoch(trainer.current_epoch)
 
+class SaveWeightsCallback(pl.Callback):
+    def __init__(self, save_path):
+        self.save_path = save_path
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Save an intermediate checkpoint every 5,000 steps on rank 0
+        if trainer.global_rank == 0 and trainer.global_step > 0 and trainer.global_step % 5000 == 0:
+            step_path = self.save_path.replace(".pt", f"_step_{trainer.global_step}.pt")
+            sd = pl_module.state_dict()
+            keys_to_remove = [k for k in sd.keys() if 'loss' in k or 'train_' in k]
+            for k in keys_to_remove:
+                if k in sd:
+                    del sd[k]
+            torch.save(sd, step_path)
+            print(f"[Step {trainer.global_step}] Intermediate checkpoint saved to: {step_path}")
+
+    def on_train_end(self, trainer, pl_module):
+        if trainer.global_rank == 0:
+            sd = pl_module.state_dict()
+            keys_to_remove = [k for k in sd.keys() if 'loss' in k or 'train_' in k]
+            for k in keys_to_remove:
+                if k in sd:
+                    del sd[k]
+            torch.save(sd, self.save_path)
+            print(f"[on_train_end] Final model weights saved successfully to: {self.save_path}")
+
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0):
         super().__init__()
@@ -173,7 +200,7 @@ class BelkaModel(pl.LightningModule):
         self.backbone = AutoModel.from_pretrained(
             MODEL_NAME,
             token=HF_TOKEN,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             attn_implementation="sdpa",
         )
         self.backbone.resize_token_embeddings(vocab)
@@ -201,8 +228,6 @@ class BelkaModel(pl.LightningModule):
             nn.Linear(mlp_hidden_size, 3),
         )
         self.loss = FocalLoss(CFG["focal_gamma"])
-        self.tr_ap = MultilabelAveragePrecision(num_labels=3, average="macro")
-        self.tr_auc = MultilabelAUROC(num_labels=3, average="macro")
         self.train_loss_avg = MeanMetric()
 
     def forward(self, ids, mask):
@@ -218,13 +243,8 @@ class BelkaModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         logits = self(batch["input_ids"], batch["attention_mask"])
         loss = self.loss(logits, batch["labels"])
-        preds = torch.sigmoid(logits)
-        self.tr_ap.update(preds, batch["labels"].long())
-        self.tr_auc.update(preds, batch["labels"].long())
         self.train_loss_avg.update(loss)
         self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False)
-        self.log("train_AP", self.tr_ap, on_step=False, on_epoch=True)
-        self.log("train_AUC", self.tr_auc, on_step=False, on_epoch=True)
         return loss
 
     def on_train_epoch_end(self):
@@ -284,6 +304,8 @@ def train_full(tokenizer):
     pl.seed_everything(SEED)
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
     num_train_samples = 0
     for f in sorted(glob.glob(os.path.join(DATA_DIR, "*.parquet"))):
         pf = pq.ParquetFile(f)
@@ -326,9 +348,11 @@ def train_full(tokenizer):
 
     model = BelkaModel(vocab=len(tokenizer), num_train_samples=num_train_samples)
     reseed_cb = ReseedCallback(train_ds)
+    save_cb = SaveWeightsCallback(FINAL_WEIGHTS)
 
     strategy = DDPStrategy(
-        find_unused_parameters=True,
+        find_unused_parameters=False,
+        timeout=timedelta(minutes=60),
     ) if world_size > 1 else "auto"
 
     trainer = pl.Trainer(
@@ -338,7 +362,7 @@ def train_full(tokenizer):
         precision="bf16-mixed",
         max_epochs=CFG["epochs"],
         logger=logger,
-        callbacks=[reseed_cb],
+        callbacks=[reseed_cb, save_cb],
         limit_train_batches=train_batches,
         log_every_n_steps=20,
         num_sanity_val_steps=0,
@@ -351,19 +375,14 @@ def train_full(tokenizer):
         train_dataloaders=train_dl
     )
 
-    # Save final trained weights
-    if trainer.global_rank == 0:
-        out_weights = os.path.join(CKPT_DIR, f"380_full_{SEED}.pt")
-        sd = model.state_dict()
-        keys_to_remove = [k for k in sd.keys() if 'loss' in k or 'tr_' in k or 'train_' in k]
-        for k in keys_to_remove:
-            del sd[k]
-        torch.save(sd, out_weights)
-        print(f"Full dataset training complete! Final weights saved to: {out_weights}")
+    # Cleanly teardown DDP across all ranks
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
-        # Teardown DDP before test inference
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+    # Rank 0 executes test set inference
+    if local_rank == 0:
+        print(f"Full dataset training complete! Verified final weights at: {FINAL_WEIGHTS}")
 
         del model, trainer, train_dl, train_ds
         gc.collect()
@@ -382,7 +401,7 @@ def train_full(tokenizer):
                 canon_smiles = pool.map(canon_single, unique_smiles)
 
             inf_model = BelkaModel(vocab=len(tokenizer), num_train_samples=num_train_samples)
-            inf_sd = torch.load(out_weights, map_location="cpu", weights_only=False)
+            inf_sd = torch.load(FINAL_WEIGHTS, map_location="cpu", weights_only=False)
             inf_model.load_state_dict(inf_sd, strict=False)
             inf_model.eval()
             if torch.cuda.is_available():
@@ -392,7 +411,7 @@ def train_full(tokenizer):
             ds = TestDataset(canon_smiles, tokenizer, max_len=128)
             dl = DataLoader(
                 ds,
-                batch_size=CFG["batch_size"],
+                batch_size=512,
                 num_workers=8,
                 pin_memory=True,
                 prefetch_factor=4,
@@ -455,13 +474,14 @@ def main():
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
                 backend="nccl" if torch.cuda.is_available() else "gloo",
-                init_method="env://"
+                init_method="env://",
+                timeout=timedelta(minutes=60),
             )
 
     if local_rank == 0:
         print("Downloading tokenizer and backbone to HF cache …")
         AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
-        AutoModel.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+        AutoModel.from_pretrained(MODEL_NAME, token=HF_TOKEN, dtype=torch.bfloat16)
         open(MODEL_SENTINEL, "w").close()
         print("Models cached.")
     else:

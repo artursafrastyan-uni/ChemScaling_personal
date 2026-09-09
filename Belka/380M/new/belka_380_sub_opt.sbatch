@@ -5,8 +5,8 @@
 #SBATCH --gres=gpu:h100:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=250G
-#SBATCH --time=24:00:00
-#SBATCH --array=0-2
+#SBATCH --time=07:00:00
+#SBATCH --array=0-1
 #SBATCH --output=/mnt/weka/asafrastyan/ChemScaling_personal/Belka/380M/new/logs/%x_%A_%a.out
 #SBATCH --error=/mnt/weka/asafrastyan/ChemScaling_personal/Belka/380M/new/logs/%x_%A_%a.err
 #SBATCH --mail-user=arthsafrastyan@gmail.com
@@ -21,7 +21,7 @@ export OMP_NUM_THREADS=1
 cd /mnt/weka/asafrastyan/ChemScaling_personal/Belka/380M/new
 mkdir -p logs
 
-SCRIPTS=("belka_380_sub_opt_42.py" "belka_380_sub_opt_75.py" "belka_380_sub_opt_85.py")
+SCRIPTS=("belka_380_sub_opt_5.py" "belka_380_sub_opt_97.py")
 CURRENT_SCRIPT=${SCRIPTS[$SLURM_ARRAY_TASK_ID]}
 
 NGPUS=8

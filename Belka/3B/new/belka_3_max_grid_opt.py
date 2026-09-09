@@ -4,6 +4,8 @@ import warnings
 warnings.filterwarnings("ignore")
 import time
 import random
+import gc
+from datetime import timedelta
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -17,9 +19,9 @@ import wandb
 import multiprocessing
 from rdkit import Chem
 from torch.utils.data import DataLoader, IterableDataset, Dataset
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, AutoModel, get_cosine_schedule_with_warmup
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.strategies import DDPStrategy
 from torchmetrics.classification import MultilabelAveragePrecision, MultilabelAUROC
 from torchmetrics import MeanMetric
@@ -45,8 +47,8 @@ CKPT_DIR       = "/mnt/weka/asafrastyan/refined/belka/3/weights"
 os.makedirs(DATA_DIR,  exist_ok=True)
 os.makedirs(CKPT_DIR,  exist_ok=True)
 
-# Global tracker for best validation score across trials
 GLOBAL_BEST_VAL_AP = -1.0
+GLOBAL_VAL_ROWS = None
 
 CFG = {
     "batch_size":   128,
@@ -148,9 +150,10 @@ class TrainDataset(IterableDataset):
                     t   = pf.read_row_group(g)
                     sm  = t["smiles"].to_numpy()
                     sub = t["subset"].to_numpy()
-                    # Filter indices: train set (subset == 0) and 10% sample (hash % 10 == 0)
+                    
+                    # 10% subset filtering: subset == 0 and md5 hash mod 10 == 0
                     idx = [
-                        i for i, s in enumerate(sm)
+                        i for i, s in enumerate(sm) 
                         if sub[i] == 0 and int(hashlib.md5(s.encode('utf-8')).hexdigest(), 16) % 10 == 0
                     ]
                     if len(idx) == 0:
@@ -179,26 +182,28 @@ class ValDataset(Dataset):
     def __init__(self, tokenizer, max_len=128):
         self.tokenizer = tokenizer
         self.max_len   = max_len
-        self.rows      = []
-        print("Loading validation set into memory …")
-        for f in sorted(glob.glob(os.path.join(DATA_DIR, "*.parquet"))):
-            t   = pq.read_table(f)
-            sm_list = t["smiles"].to_pylist()
-            b4_list = t["BRD4"].to_pylist()
-            hs_list = t["HSA"].to_pylist()
-            se_list = t["sEH"].to_pylist()
-            sub_list = t["subset"].to_pylist()
-            
-            # Filter rows: val set (subset == 1) and downsample to ~10% of val (~95k samples)
-            for i, s_str in enumerate(sm_list):
-                if sub_list[i] == 1 and int(hashlib.md5(s_str.encode('utf-8')).hexdigest(), 16) % 10 == 0:
-                    self.rows.append((
-                        s_str,
-                        int(b4_list[i]),
-                        int(hs_list[i]),
-                        int(se_list[i]),
-                    ))
-        print(f"Validation set: {len(self.rows):,} molecules")
+        global GLOBAL_VAL_ROWS
+        if GLOBAL_VAL_ROWS is None:
+            rows = []
+            for f in sorted(glob.glob(os.path.join(DATA_DIR, "*.parquet"))):
+                t = pq.read_table(f, columns=["smiles", "subset", "BRD4", "HSA", "sEH"])
+                sm_list  = t["smiles"].to_pylist()
+                b4_list  = t["BRD4"].to_pylist()
+                hs_list  = t["HSA"].to_pylist()
+                se_list  = t["sEH"].to_pylist()
+                sub_list = t["subset"].to_pylist()
+                
+                for i, s_str in enumerate(sm_list):
+                    if sub_list[i] == 1 and int(hashlib.md5(s_str.encode('utf-8')).hexdigest(), 16) % 10 == 0:
+                        rows.append((
+                            s_str,
+                            int(b4_list[i]),
+                            int(hs_list[i]),
+                            int(se_list[i]),
+                        ))
+            GLOBAL_VAL_ROWS = rows
+            print(f"Validation set loaded into shared memory: {len(GLOBAL_VAL_ROWS):,} molecules")
+        self.rows = GLOBAL_VAL_ROWS
 
     def __len__(self):
         return len(self.rows)
@@ -249,7 +254,7 @@ class BelkaModel(pl.LightningModule):
         self.backbone = AutoModel.from_pretrained(
             MODEL_NAME,
             token=HF_TOKEN,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             attn_implementation="sdpa"
         )
         self.backbone.resize_token_embeddings(vocab)
@@ -289,67 +294,76 @@ class BelkaModel(pl.LightningModule):
 
     def forward(self, ids, mask):
         h = self.backbone(input_ids=ids, attention_mask=mask).last_hidden_state
-        if self.pooling == "attn":
-            pooled = self.pool(h, attention_mask=mask)
-        elif self.pooling == "last_token":
+        if self.pooling == "last_token":
             batch_idx = torch.arange(ids.shape[0], device=ids.device)
             last_token_idx = mask.sum(1).long() - 1
             pooled = h[batch_idx, last_token_idx, :]
+        elif self.pooling == "attn":
+            pooled = self.pool(h, attention_mask=mask)
         else:
             pooled = _mean_pool(h, attention_mask=mask)
-
         return self.head(pooled)
 
-    def training_step(self, batch, _):
+    def training_step(self, batch, batch_idx):
         logits = self(batch["input_ids"], batch["attention_mask"])
-        loss   = self.loss(logits, batch["labels"])
-        preds  = logits.sigmoid()
-        self.tr_ap.update(preds,  batch["labels"].long())
+        loss = self.loss(logits, batch["labels"])
+        preds = torch.sigmoid(logits)
+        self.tr_ap.update(preds, batch["labels"].long())
         self.tr_auc.update(preds, batch["labels"].long())
         self.train_loss_avg.update(loss)
-        self.log("train_loss", loss, on_step=True, on_epoch=False,
-                 prog_bar=True, sync_dist=False)
-        self.log("train_AP",  self.tr_ap,  on_step=False, on_epoch=True)
-        self.log("train_AUC", self.tr_auc, on_step=False, on_epoch=True)
+        self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False)
         return loss
 
-    def validation_step(self, batch, _):
+    def on_train_epoch_end(self):
+        train_loss_epoch = self.train_loss_avg.compute()
+        self.log("train_loss_epoch", train_loss_epoch, sync_dist=True)
+        self.train_loss_avg.reset()
+
+    def validation_step(self, batch, batch_idx):
         logits = self(batch["input_ids"], batch["attention_mask"])
-        loss   = self.loss(logits, batch["labels"])
-        preds  = logits.sigmoid()
-        self.val_ap.update(preds,  batch["labels"].long())
+        loss = self.loss(logits, batch["labels"])
+        preds = torch.sigmoid(logits)
+        self.val_ap.update(preds, batch["labels"].long())
         self.val_auc.update(preds, batch["labels"].long())
-        self.log("val_loss", loss, on_step=False, on_epoch=True,
-                 prog_bar=True, sync_dist=True)
-        self.log("val_AP",  self.val_ap,  on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val_AUC", self.val_auc, on_step=False, on_epoch=True)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        return loss
 
     def on_validation_epoch_end(self):
-        if not self.trainer.sanity_checking:
-            train_loss_val = self.train_loss_avg.compute()
-            self.log("train_loss_val", train_loss_val, sync_dist=True)
-            self.train_loss_avg.reset()
+        ap = self.val_ap.compute()
+        auc = self.val_auc.compute()
+        tr_ap = self.tr_ap.compute()
+        tr_auc = self.tr_auc.compute()
+        train_loss_val = self.train_loss_avg.compute()
+
+        self.log("val_AP", ap, sync_dist=True, prog_bar=True)
+        self.log("val_AUC", auc, sync_dist=True)
+        self.log("train_AP", tr_ap, sync_dist=True)
+        self.log("train_AUC", tr_auc, sync_dist=True)
+        self.log("train_loss_val", train_loss_val, sync_dist=True)
+
+        self.val_ap.reset()
+        self.val_auc.reset()
+        self.tr_ap.reset()
+        self.tr_auc.reset()
+        self.train_loss_avg.reset()
 
     def configure_optimizers(self):
         backbone_params = [p for p in self.backbone.parameters() if p.requires_grad]
-        head_params     = list(self.head.parameters())
+        head_params = list(self.head.parameters())
 
         opt = torch.optim.AdamW([
-            {"params": backbone_params, "lr": CFG["backbone_lr"],
-             "weight_decay": CFG["weight_decay"]},
-            {"params": head_params,     "lr": CFG["head_lr"],
-             "weight_decay": CFG["weight_decay"]},
+            {"params": backbone_params, "lr": CFG["backbone_lr"], "weight_decay": CFG["weight_decay"]},
+            {"params": head_params, "lr": CFG["head_lr"], "weight_decay": CFG["weight_decay"]},
         ])
 
         world = max(self.trainer.world_size, 1)
         total = (self.num_train_samples // (CFG["batch_size"] * world * 4)) * CFG["epochs"]
-        sch   = get_cosine_schedule_with_warmup(
+        sch = get_cosine_schedule_with_warmup(
             opt,
             num_warmup_steps=int(total * CFG["warmup_ratio"]),
             num_training_steps=total,
         )
-        return {"optimizer": opt,
-                "lr_scheduler": {"scheduler": sch, "interval": "step"}}
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "step"}}
 
 def train_trial(tokenizer):
     pl.seed_everything(SEED)
@@ -361,12 +375,11 @@ def train_trial(tokenizer):
         sm_list = t["smiles"].to_pylist()
         sub_list = t["subset"].to_pylist()
         num_train_samples += sum(1 for i, s in enumerate(sm_list) if sub_list[i] == 0 and int(hashlib.md5(s.encode('utf-8')).hexdigest(), 16) % 10 == 0)
+    
     print(f"Number of train samples (subsampled): {num_train_samples:,}")
-
     train_batches = num_train_samples // (CFG["batch_size"] * world_size)
 
     def custom_collate(batch):
-        from torch.nn.utils.rnn import pad_sequence
         input_ids = [item["input_ids"] for item in batch]
         attention_mask = [item["attention_mask"] for item in batch]
         labels = [item["labels"] for item in batch]
@@ -385,18 +398,18 @@ def train_trial(tokenizer):
     train_dl = DataLoader(
         train_ds,
         batch_size=CFG["batch_size"],
-        num_workers=8,
+        num_workers=4,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=2,
         collate_fn=custom_collate
     )
+    val_ds = ValDataset(tokenizer, max_len=128)
     val_dl = DataLoader(
-        ValDataset(tokenizer, max_len=128),
+        val_ds,
         batch_size=CFG["batch_size"],
-        num_workers=8,
+        num_workers=4,
         pin_memory=True,
-        prefetch_factor=4,
-        persistent_workers=True,
+        prefetch_factor=2,
         collate_fn=custom_collate
     )
     
@@ -406,22 +419,12 @@ def train_trial(tokenizer):
         log_model=False,
     )
 
-    global GLOBAL_BEST_VAL_AP
-
     model = BelkaModel(vocab=len(tokenizer), num_train_samples=num_train_samples)
-    
     reseed_cb = ReseedCallback(train_ds)
-    
-    ckpt_cb = ModelCheckpoint(
-        monitor="val_AP", 
-        dirpath=CKPT_DIR,
-        filename="3_max_grid_trial", 
-        save_top_k=1, 
-        mode="max"
-    )
 
     strategy = DDPStrategy(
-        find_unused_parameters=True,
+        find_unused_parameters=False,
+        timeout=timedelta(minutes=60),
     ) if world_size > 1 else "auto"
 
     trainer = pl.Trainer(
@@ -431,7 +434,8 @@ def train_trial(tokenizer):
         precision="bf16-mixed",
         max_epochs=CFG["epochs"],
         logger=logger,
-        callbacks=[reseed_cb, ckpt_cb],
+        callbacks=[reseed_cb],
+        enable_checkpointing=False,
         limit_train_batches=train_batches,
         val_check_interval=5000,
         log_every_n_steps=10,
@@ -444,14 +448,10 @@ def train_trial(tokenizer):
         val_dataloaders=val_dl
     )
 
-    if trainer.global_rank == 0 and ckpt_cb.best_model_path:
-        current_score = ckpt_cb.best_model_score.item()
-        if current_score > GLOBAL_BEST_VAL_AP:
-            GLOBAL_BEST_VAL_AP = current_score
-            sd = torch.load(ckpt_cb.best_model_path, map_location="cpu", weights_only=False).get("state_dict", {})
-            out = os.path.join(CKPT_DIR, "3_max_grid.pt")
-            torch.save(sd, out)
-            print(f"New global best weights saved to {out} (Score: {current_score:.5f})")
+    # Clean up trial objects from memory
+    del model, trainer, train_dl, train_ds, val_dl, val_ds
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def main():
     pl.seed_everything(SEED)
@@ -467,17 +467,20 @@ def main():
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
                 backend="nccl" if torch.cuda.is_available() else "gloo",
-                init_method="env://"
+                init_method="env://",
+                timeout=timedelta(minutes=60),
             )
 
     if local_rank == 0:
         print("Downloading tokenizer and backbone to HF cache …")
         AutoTokenizer.from_pretrained(TOKENIZER_NAME, token=HF_TOKEN)
-        AutoModel.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+        AutoModel.from_pretrained(MODEL_NAME, token=HF_TOKEN, dtype=torch.bfloat16)
         open(MODEL_SENTINEL, "w").close()
         print("Models cached.")
+
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
     else:
-        print(f"[rank {local_rank}] waiting for model cache …")
         while not os.path.exists(MODEL_SENTINEL):
             time.sleep(2)
 
@@ -490,8 +493,10 @@ def main():
     
     if local_rank == 0:
         prepare_data()
+
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
     else:
-        print(f"[rank {local_rank}] waiting for data …")
         while not os.path.exists(SENTINEL):
             time.sleep(2)
 
@@ -562,7 +567,7 @@ def main():
             CFG.update(config)
             train_trial(tokenizer)
 
-        wandb.agent(sweep_id, project="chemlactica-belka-thesis", entity="artur_safrastyan-american-university-of-armenia", function=sweep_train, count=20)
+        wandb.agent(sweep_id, project="chemlactica-belka-thesis", entity="artur_safrastyan-american-university-of-armenia", function=sweep_train, count=15)
 
         signal = [False, None]
         if world_size > 1:
@@ -581,6 +586,9 @@ def main():
             
             train_trial(tokenizer)
 
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
     main()
