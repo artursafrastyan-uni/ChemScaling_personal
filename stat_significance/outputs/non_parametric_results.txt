@@ -1,0 +1,24 @@
+
+--- Task: Polaris ---
+Friedman Test p-value: 0.32337
+
+--- Task: PXR ---
+Friedman Test p-value: 0.05375
+
+--- Task: BELKA Private ---
+Friedman Test p-value: 0.00285
+Nemenyi Pairwise p-values:
+      170M  380M  1.3B  3B
+170M   NaN   NaN   NaN NaN
+380M   NaN   NaN   NaN NaN
+1.3B   NaN   NaN   NaN NaN
+3B     NaN   NaN   NaN NaN
+
+--- Task: BELKA Public ---
+Friedman Test p-value: 0.02110
+Nemenyi Pairwise p-values:
+      170M  380M  1.3B  3B
+170M   NaN   NaN   NaN NaN
+380M   NaN   NaN   NaN NaN
+1.3B   NaN   NaN   NaN NaN
+3B     NaN   NaN   NaN NaN
