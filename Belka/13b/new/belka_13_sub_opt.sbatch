@@ -1,26 +1,26 @@
 #!/bin/bash -l
 #SBATCH --job-name=belka_13_full_opt
-#SBATCH --partition=research8
-#SBATCH --account=research
+#SBATCH --partition=<YOUR_PARTITION>
+#SBATCH --account=<YOUR_ACCOUNT>
 #SBATCH --gres=gpu:h100:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=250G
 #SBATCH --time=15:00:00
 #SBATCH --array=0-1
-#SBATCH --output=/mnt/weka/asafrastyan/ChemScaling_personal/Belka/13b/new/logs/%x_%A_%a.out
-#SBATCH --error=/mnt/weka/asafrastyan/ChemScaling_personal/Belka/13b/new/logs/%x_%A_%a.err
-#SBATCH --mail-user=arthsafrastyan@gmail.com
+#SBATCH --output=./logs/%x_%A_%a.out
+#SBATCH --error=./logs/%x_%A_%a.err
+#SBATCH --mail-user=<YOUR_EMAIL>
 #SBATCH --mail-type=BEGIN,END,FAIL
 
-source /home/asafrastyan/miniforge3/etc/profile.d/conda.sh
-conda activate chemproject
+source /path/to/conda/etc/profile.d/conda.sh
+conda activate <YOUR_CONDA_ENV>
 
-export HF_TOKEN=$(cat ~/.hf_token)
+export HF_TOKEN="${HF_TOKEN:-<YOUR_HF_TOKEN>}"
 export OMP_NUM_THREADS=1
 
 SCRIPTS=(
-  "/mnt/weka/asafrastyan/ChemScaling_personal/Belka/13b/new/belka_13_sub_opt_5.py"
-  "/mnt/weka/asafrastyan/ChemScaling_personal/Belka/13b/new/belka_13_sub_opt_97.py"
+  "/path/to/project/Belka/<MODEL_SIZE>/new/belka_13_sub_opt_5.py"
+  "/path/to/project/Belka/<MODEL_SIZE>/new/belka_13_sub_opt_97.py"
 )
 CURRENT_SCRIPT=${SCRIPTS[$SLURM_ARRAY_TASK_ID]}
 SCRIPT_DIR=$(dirname "$CURRENT_SCRIPT")

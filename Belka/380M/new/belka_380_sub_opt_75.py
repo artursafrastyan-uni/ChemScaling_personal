@@ -27,23 +27,23 @@ from torchmetrics import MeanMetric
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.pop("WANDB_REQUIRE_SERVICE", None)
-WANDB_BASE = "/mnt/weka/asafrastyan/wandb"
+WANDB_BASE = "/path/to/wandb"
 WANDB_CACHE = os.path.join(WANDB_BASE, "cache")
 WANDB_LOGS = os.path.join(WANDB_BASE, "logs")
 os.makedirs(WANDB_CACHE, exist_ok=True)
 os.makedirs(WANDB_LOGS, exist_ok=True)
 os.environ["WANDB_CACHE_DIR"] = WANDB_CACHE
 os.environ["WANDB_DIR"] = WANDB_LOGS
-os.environ["HF_TOKEN"] = "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"
+os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "<YOUR_HF_TOKEN>")
 HF_TOKEN       = os.environ["HF_TOKEN"]
-MODEL_NAME     = "yerevann/ChemLlama-380M"
-TOKENIZER_NAME = "yerevann/ChemLlama-380M"
+MODEL_NAME     = "<MODEL_NAME_OR_PATH>"
+TOKENIZER_NAME = "<TOKENIZER_NAME_OR_PATH>"
 SEED           = 75
-RAW_PARQUET    = "/mnt/weka/asafrastyan/belka/data/train.parquet"
-DATA_DIR       = "/mnt/weka/asafrastyan/belka/data/processed_full"
-CKPT_DIR       = "/mnt/weka/asafrastyan/refined/belka/380/weights"
-TEST_PATH      = "/mnt/weka/asafrastyan/belka/data/test.parquet"
-SUB_PATH       = f"/mnt/weka/asafrastyan/refined/belka/380/submission_380_full_{SEED}.csv"
+RAW_PARQUET    = "/path/to/data/train.parquet"
+DATA_DIR       = "/path/to/data/processed"
+CKPT_DIR       = "/path/to/checkpoints"
+TEST_PATH      = "/path/to/data/test.parquet"
+SUB_PATH       = f"/path/to/outputs/submission_{SEED}.csv"
 FINAL_WEIGHTS  = os.path.join(CKPT_DIR, f"380_full_{SEED}.pt")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CKPT_DIR, exist_ok=True)
